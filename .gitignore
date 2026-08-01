@@ -7,9 +7,16 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
-# Orchestration state — worker worktrees and run logs are local scratch
+# Orchestration state — worker worktrees, run logs, pidfiles and morning
+# reports are all local scratch.
 .worktrees/
-orchestrator/runs/*.json
+orchestrator/runs/
+
+# Queued task files are ephemeral work orders, not source. Untracked so that
+# queueing work does not dirty the tree — which overnight.sh's preflight
+# refuses to run against.
+orchestrator/tasks/queue/*
+!orchestrator/tasks/queue/README.md
 
 # Filing cache and derived stores can be regenerated from EDGAR
 data/cache/
