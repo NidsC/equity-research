@@ -12,9 +12,9 @@
 # By default the worker runs in the background and this script returns
 # immediately with the PID. Pass --fg to block until it finishes.
 #
-# Every worker is bounded twice — a wall-clock timeout and a turn cap. Nothing
-# here is supervised while it runs overnight, so a worker that wedges or loops
-# must stop on its own rather than bill until morning.
+# Nothing here is supervised while it runs overnight, so a worker that wedges or
+# loops must stop on its own rather than bill until morning. The bound is a
+# wall-clock timeout; overnight.sh adds a spend ceiling across the whole queue.
 
 set -euo pipefail
 
@@ -27,9 +27,13 @@ WORKER="$1"
 TASK_FILE="$2"
 MODE="${3:---bg}"
 
-# Bounds. Override per-dispatch through the environment.
+# Wall-clock bound. Override per-dispatch through the environment.
+#
+# There is deliberately no turn cap: `--max-turns` is not in this CLI's
+# documented flag surface, and its argument parser accepts unknown flags without
+# complaint, so a typo'd bound would look like it was working right up until it
+# wasn't. An unattended run should not rest on a flag that cannot be verified.
 TIMEOUT="${ER_WORKER_TIMEOUT:-1800}"
-MAX_TURNS="${ER_WORKER_MAX_TURNS:-60}"
 
 ROOT="$(git rev-parse --show-toplevel)"
 WORKTREE="$ROOT/.worktrees/$WORKER"
@@ -105,7 +109,6 @@ run_worker() {
     _with_timeout "$TIMEOUT" claude -p "$(cat "$TASK_FILE")" \
         --output-format json \
         --permission-mode acceptEdits \
-        --max-turns "$MAX_TURNS" \
         --allowedTools "$ALLOWED_TOOLS" \
         --disallowedTools 'Bash(git push:*),Bash(rm:*),Bash(curl:*),WebFetch' \
         > "$RESULT" 2> "$LOG" || rc=$?

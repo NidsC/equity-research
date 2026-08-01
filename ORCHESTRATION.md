@@ -107,9 +107,14 @@ Nothing is supervised while it runs, so every loop is bounded independently:
 | Bound | Default | Set by |
 |---|---|---|
 | Per-worker wall clock | 1800s | `ER_WORKER_TIMEOUT` / `--timeout` |
-| Per-worker turns | 60 | `ER_WORKER_MAX_TURNS` |
 | Total spend | $20 | `--budget` |
 | Concurrent workers | 3 | `--parallel` |
+
+There is no per-worker turn cap. `--max-turns` is not in the Claude CLI's
+documented flag surface, and its parser accepts unknown flags silently — a bound
+that cannot be verified is worse than no bound, because it reads as protection
+that isn't there. Wall clock and spend are both observable, so those are the two
+we rely on.
 
 Budget is checked before each dispatch and after each poll. On breach, in-flight
 workers are killed and the rest of the queue is left undispatched and reported.
