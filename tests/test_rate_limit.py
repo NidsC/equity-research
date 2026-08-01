@@ -1,4 +1,4 @@
-"""Rate limiter tests. No network — the limiter is exercised directly."""
+"""Rate limiter tests. No network — the limiters are exercised directly."""
 
 from __future__ import annotations
 
@@ -7,9 +7,11 @@ import time
 import pytest
 
 from equity_research.ingest.edgar import (
+    LOCK_FILENAME,
     SUSTAINED_REQUESTS,
     SUSTAINED_WINDOW_SECONDS,
     RateLimitTripwire,
+    _CrossProcessGate,
     _RateLimiter,
 )
 
@@ -86,3 +88,87 @@ def test_default_limiter_sits_well_under_the_sec_ceiling():
     limiter = _RateLimiter()
     assert limiter._refill_per_second == SUSTAINED_REQUESTS / SUSTAINED_WINDOW_SECONDS
     assert limiter._refill_per_second <= 2.0  # SEC ceiling is 10/s
+
+
+# ---- cross-process gate ------------------------------------------------
+#
+# Separate gate instances over one ledger file stand in for separate worker
+# processes: all of the shared state lives in the file, so two instances are
+# indistinguishable from two interpreters.
+
+
+def _gate(tmp_path, **kw):
+    return _CrossProcessGate(tmp_path / LOCK_FILENAME, **kw)
+
+
+def test_gate_paces_a_second_process_that_did_not_spend_the_budget(tmp_path):
+    """The whole point: worker B is throttled by worker A's traffic."""
+    a = _gate(tmp_path, capacity=2, window_seconds=1.0)
+    b = _gate(tmp_path, capacity=2, window_seconds=1.0)
+
+    a.acquire()
+    a.acquire()
+
+    # B has its own in-process budget but shares the ledger, so it must wait.
+    start = time.monotonic()
+    b.acquire()
+    assert time.monotonic() - start >= 0.5
+
+
+def test_independent_gates_on_separate_ledgers_do_not_interfere(tmp_path):
+    """Different cache dirs are different SEC conversations; no shared pacing."""
+    one = (tmp_path / "one").resolve()
+    two = (tmp_path / "two").resolve()
+    one.mkdir()
+    two.mkdir()
+
+    a = _gate(one, capacity=2, window_seconds=1.0)
+    b = _gate(two, capacity=2, window_seconds=1.0)
+
+    a.acquire()
+    a.acquire()
+
+    start = time.monotonic()
+    b.acquire()
+    assert time.monotonic() - start < 0.1
+
+
+def test_gate_tripwire_measures_the_aggregate(tmp_path):
+    # Capacity high enough that the bucket never throttles, so grants pile up
+    # inside the observation window and the tripwire becomes reachable.
+    gate = _gate(tmp_path, capacity=50, window_seconds=2.0, tripwire_per_second=4)
+
+    with pytest.raises(RateLimitTripwire, match="across all processes"):
+        for _ in range(10):
+            gate.acquire()
+
+
+def test_gate_tripwire_fires_on_traffic_it_did_not_issue(tmp_path):
+    """A gate must trip on the ledger's total, not just its own grants."""
+    noisy = _gate(tmp_path, capacity=50, window_seconds=2.0, tripwire_per_second=4)
+    quiet = _gate(tmp_path, capacity=50, window_seconds=2.0, tripwire_per_second=4)
+
+    for _ in range(3):
+        noisy.acquire()
+
+    # `quiet` has issued nothing, but the shared ledger is already at the line.
+    with pytest.raises(RateLimitTripwire):
+        quiet.acquire()
+
+
+def test_gate_survives_a_corrupt_ledger(tmp_path):
+    ledger = tmp_path / LOCK_FILENAME
+    ledger.write_text("{not json at all")
+
+    gate = _gate(tmp_path, capacity=2, window_seconds=1.0)
+    gate.acquire()  # must not raise
+
+    assert ledger.read_text().startswith("[")
+
+
+def test_client_gate_points_at_its_own_cache_dir(tmp_path, monkeypatch):
+    from equity_research.ingest.edgar import EdgarClient
+
+    monkeypatch.setenv("EDGAR_USER_AGENT", "Test test@example.com")
+    with EdgarClient(cache_dir=tmp_path) as client:
+        assert client._gate._path == tmp_path / LOCK_FILENAME

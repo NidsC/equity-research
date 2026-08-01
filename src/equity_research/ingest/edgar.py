@@ -4,11 +4,14 @@ EDGAR is free and unauthenticated. The two hard rules are a descriptive
 User-Agent header identifying you (email included) and a ceiling of 10
 requests/second per IP.
 
-Rate limiting here is deliberately conservative and has two independent layers:
+Rate limiting here is deliberately conservative and has three layers:
 
   1. A token bucket — 4 requests per 2 seconds sustained, burst of 4. This is
-     the throttle that actually paces traffic.
-  2. A tripwire at 8 observed requests/second that latches permanently. The
+     the throttle that actually paces traffic within one interpreter.
+  2. A cross-process gate over a shared grant ledger, so that N concurrent
+     workers pace against SEC's ceiling *in aggregate* rather than each pacing
+     to 2/s independently. See `_CrossProcessGate`.
+  3. A tripwire at 8 observed requests/second that latches permanently. The
      bucket makes 8/s unreachable, so if the tripwire ever fires it means the
      throttle has been bypassed — a second limiter instance, a direct httpx
      call, a bug. At that point the safe move is to stop the application dead
@@ -28,6 +31,11 @@ from typing import Self
 
 import httpx
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - not POSIX
+    fcntl = None  # type: ignore[assignment]
+
 SEC_HOST = "https://www.sec.gov"
 DATA_HOST = "https://data.sec.gov"
 TICKER_MAP_URL = f"{SEC_HOST}/files/company_tickers.json"
@@ -41,6 +49,10 @@ SUSTAINED_WINDOW_SECONDS = 2.0
 TRIPWIRE_REQUESTS_PER_SECOND = 8
 
 CACHE_DIR = Path(os.environ.get("ER_CACHE_DIR", "data/cache"))
+
+# Shared grant ledger, one per cache directory. Every process fetching against
+# the same cache paces against the same file.
+LOCK_FILENAME = ".edgar.lock"
 
 
 class EdgarError(RuntimeError):
@@ -146,6 +158,104 @@ class _RateLimiter:
 _limiter = _RateLimiter()
 
 
+class _CrossProcessGate:
+    """Paces EDGAR grants across every process sharing a cache directory.
+
+    `_RateLimiter` is a module global, so it bounds one interpreter. The
+    orchestrator runs several workers at once, each in its own process with its
+    own limiter — so N workers pace to 2/s *each* and SEC sees 2N/s from one IP,
+    while every per-process tripwire sees only its own share and never fires.
+    The safety net was blind to the number that actually matters.
+
+    This moves the grant ledger into a small JSON file under the shared cache
+    directory, guarded by `flock`. The bucket and the tripwire then both measure
+    what SEC sees rather than what one process contributed.
+
+    The critical section covers pacing and recording only, not the HTTP request
+    itself — bounding *grants* bounds the request rate, and holding the lock
+    across network I/O would serialise workers for no added safety.
+
+    The latch is deliberately not persisted to the file. A tripwire that
+    survived process exit would brick the tool until someone found and deleted a
+    dotfile; recovery semantics stay exactly as they were (restart clears it),
+    while detection becomes global.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        capacity: int = SUSTAINED_REQUESTS,
+        window_seconds: float = SUSTAINED_WINDOW_SECONDS,
+        tripwire_per_second: int = TRIPWIRE_REQUESTS_PER_SECOND,
+    ) -> None:
+        self._path = path
+        self._capacity = capacity
+        self._window = window_seconds
+        self._tripwire = tripwire_per_second
+
+    @property
+    def enabled(self) -> bool:
+        return fcntl is not None
+
+    @staticmethod
+    def _read(handle) -> list[float]:
+        handle.seek(0)
+        try:
+            grants = json.loads(handle.read() or "[]")
+        except json.JSONDecodeError:
+            # A torn or hand-edited ledger is not worth dying over; the worst
+            # case is one over-permissive window before it refills correctly.
+            return []
+        return [float(t) for t in grants] if isinstance(grants, list) else []
+
+    @staticmethod
+    def _write(handle, grants: list[float]) -> None:
+        handle.seek(0)
+        handle.truncate()
+        json.dump(grants, handle)
+        handle.flush()
+
+    def acquire(self) -> None:
+        if fcntl is None:  # pragma: no cover - not POSIX
+            return
+
+        # Wall-clock, not monotonic: the ledger is shared between processes and
+        # monotonic clocks are only comparable within one of them.
+        #
+        # Opened "r+" rather than "a+" on purpose — under "a+" every write is
+        # forced to EOF regardless of seek, which would silently defeat the
+        # seek/truncate rewrite below.
+        self._path.touch(exist_ok=True)
+        with open(self._path, "r+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                now = time.time()
+                grants = [t for t in self._read(handle) if now - t < self._window]
+
+                if len(grants) >= self._capacity:
+                    wait = self._window - (now - grants[0])
+                    if wait > 0:
+                        # Sleeping under the lock queues the other workers behind
+                        # us in arrival order instead of letting them stampede.
+                        time.sleep(wait)
+                    now = time.time()
+                    grants = [t for t in grants if now - t < self._window]
+
+                grants.append(now)
+                observed = sum(1 for t in grants if now - t < 1.0)
+                self._write(handle, grants)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+        if observed >= self._tripwire:
+            raise RateLimitTripwire(
+                f"EDGAR rate tripwire: {observed} requests in the last second across "
+                f"all processes (limit {self._tripwire}/s, SEC ceiling 10/s). The "
+                f"shared ledger at {self._path} should have made this impossible, so "
+                f"something is issuing requests outside it. Halting to avoid an IP ban."
+            )
+
+
 @dataclass(frozen=True)
 class Filing:
     """One filing from a company's submission history."""
@@ -178,6 +288,7 @@ class EdgarClient:
     def __init__(self, cache_dir: Path | None = None, timeout: float = 30.0) -> None:
         self.cache_dir = cache_dir or CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._gate = _CrossProcessGate(self.cache_dir / LOCK_FILENAME)
         self._client = httpx.Client(
             headers={
                 "User-Agent": _user_agent(),
@@ -209,7 +320,10 @@ class EdgarClient:
 
         last_error: Exception | None = None
         for attempt in range(3):
+            # In-process pacing first, then the shared ledger, so the grant we
+            # record is the one we are about to spend.
             _limiter.acquire()
+            self._gate.acquire()
             try:
                 response = self._client.get(url)
             except httpx.HTTPError as exc:  # transient network failure

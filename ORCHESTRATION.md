@@ -80,6 +80,74 @@ orchestrator/status.sh
 orchestrator/integrate.sh duckdb-store
 ```
 
+## Unattended mode: `overnight.sh`
+
+The manager loop above needs someone watching it. For a queue of tasks that are
+already written, `orchestrator/overnight.sh` runs the same dispatch → poll →
+integrate cycle on a schedule, with no model in the driver's seat:
+
+```bash
+# Drop task files in orchestrator/tasks/queue/, then:
+orchestrator/overnight.sh --dry-run            # what would be dispatched
+orchestrator/overnight.sh --budget 20 --parallel 3
+```
+
+Install `config/com.equity-research.overnight.plist.example` as a LaunchAgent to
+fire it nightly. The header of that file has the install steps.
+
+A scheduler rather than a manager agent, because the two jobs are different: a
+model is worth paying for when tasks need decomposing, and is a liability at 3am
+when it might decide to try something clever. Decompose in the evening while you
+are awake; let the scheduler execute.
+
+### What bounds it
+
+Nothing is supervised while it runs, so every loop is bounded independently:
+
+| Bound | Default | Set by |
+|---|---|---|
+| Per-worker wall clock | 1800s | `ER_WORKER_TIMEOUT` / `--timeout` |
+| Per-worker turns | 60 | `ER_WORKER_MAX_TURNS` |
+| Total spend | $20 | `--budget` |
+| Concurrent workers | 3 | `--parallel` |
+
+Budget is checked before each dispatch and after each poll. On breach, in-flight
+workers are killed and the rest of the queue is left undispatched and reported.
+
+### Preflight refuses more than it accepts
+
+The run aborts before dispatching anything if the tests already fail on the
+current branch, `.venv/bin/python` is missing, `EDGAR_USER_AGENT` is unset, the
+working tree is dirty, or the queue directory does not exist. Each of those makes
+the entire run worthless rather than partially useful — a queue merged onto a
+broken base tells you nothing, and it is cheaper to refuse at 22:00 than to find
+out at 07:00.
+
+### In the morning
+
+`orchestrator/runs/report-<stamp>.md` lists what merged, what completed but was
+refused (tests failed or merge conflict), what died, what never ran, and the
+total spend. The exit status is non-zero if anything needs you, so it shows up in
+the launchd log. Branches for unmerged work are kept — `agent/<worker>` is still
+there to inspect.
+
+### Two things that will bite you
+
+**A LaunchAgent only fires while you are logged in, and a sleeping Mac does not
+run it.** If the machine sleeps at 22:00 the job runs whenever it next wakes. To
+hold it awake for the window:
+
+```bash
+caffeinate -s -t 28800 &     # 8 hours, and only while on AC power
+```
+
+**EDGAR pacing is shared, so parallelism costs throughput.** `EdgarClient` gates
+every request through a lock file in the cache directory (`.edgar.lock`), so
+three workers fetching at once still pace to 2 requests/second in aggregate
+rather than 2/s each. This is deliberate — see the note below — but it means
+network-bound tasks do not speed up with `--parallel`. Code tasks working off the
+existing cache are unaffected.
+
 ## Writing task files
 
 A task file is the worker's entire brief; it cannot ask you a follow-up question.
@@ -101,7 +169,23 @@ will collide. One on `parse/financials.py` and one on `parse/sections.py` will n
 More than four and you spend more time reviewing merges than the parallelism saved.
 
 **Never merge on the worker's say-so.** `integrate.sh` runs the test suite before
-merging for exactly this reason. An agent reporting success is a claim, not evidence.
+merging for exactly this reason. An agent reporting success is a claim, not
+evidence. It also fails *closed*: if the worktree is missing and the branch
+cannot be verified, it refuses rather than merging unverified work.
+
+**Use `.venv/bin/python`, never bare `python3`.** Both `integrate.sh` and the
+worker instructions in `.claude/CLAUDE.md` name the venv interpreter explicitly.
+`python3` is whatever is first on PATH — on a machine with Anaconda ahead of it,
+that interpreter has pytest but not this project's dependencies, so the suite
+dies during collection and every merge is refused for a reason unrelated to the
+worker's changes. Unattended, that silently wedges the whole queue.
+
+**EDGAR pacing is per-cache-directory, not per-process.** The token bucket in
+`ingest/edgar.py` is a module global, so it bounds one interpreter; N workers
+would otherwise pace to 2/s each and put 2N/s on one IP against SEC's 10/s
+ceiling, with every per-process tripwire seeing only its own share and never
+firing. `_CrossProcessGate` moves the grant ledger into `.edgar.lock` under the
+cache directory so both the bucket and the tripwire measure what SEC sees.
 
 **Workers cannot push.** `--disallowedTools` blocks `git push`, `rm`, and `curl`.
 Widen this only when you have a specific reason.

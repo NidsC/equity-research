@@ -11,6 +11,10 @@
 #
 # By default the worker runs in the background and this script returns
 # immediately with the PID. Pass --fg to block until it finishes.
+#
+# Every worker is bounded twice — a wall-clock timeout and a turn cap. Nothing
+# here is supervised while it runs overnight, so a worker that wedges or loops
+# must stop on its own rather than bill until morning.
 
 set -euo pipefail
 
@@ -23,12 +27,17 @@ WORKER="$1"
 TASK_FILE="$2"
 MODE="${3:---bg}"
 
+# Bounds. Override per-dispatch through the environment.
+TIMEOUT="${ER_WORKER_TIMEOUT:-1800}"
+MAX_TURNS="${ER_WORKER_MAX_TURNS:-60}"
+
 ROOT="$(git rev-parse --show-toplevel)"
 WORKTREE="$ROOT/.worktrees/$WORKER"
 BRANCH="agent/$WORKER"
 RUNS="$ROOT/orchestrator/runs"
 RESULT="$RUNS/$WORKER.json"
 LOG="$RUNS/$WORKER.log"
+PIDFILE="$RUNS/$WORKER.pid"
 
 if [[ ! -f "$ROOT/$TASK_FILE" && ! -f "$TASK_FILE" ]]; then
     echo "task file not found: $TASK_FILE" >&2
@@ -49,22 +58,79 @@ fi
 # Tools the worker is allowed to use without asking. Bash is scoped to specific
 # commands rather than opened wholesale — an unattended agent with unrestricted
 # shell is not something you want running while you are away from the keyboard.
-ALLOWED_TOOLS='Read,Write,Edit,Glob,Grep,TodoWrite,Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(uv:*),Bash(ruff:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(mkdir:*)'
+#
+# `.venv/bin/python` is listed explicitly: it is the only interpreter with the
+# project's dependencies installed, and `Bash(python3:*)` does not match a path.
+ALLOWED_TOOLS='Read,Write,Edit,Glob,Grep,TodoWrite,Bash(.venv/bin/python:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(uv:*),Bash(ruff:*),Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(ls:*),Bash(mkdir:*)'
+
+# No `timeout(1)` on macOS and no `gtimeout` unless coreutils is installed, so
+# fall back to perl: a pending alarm survives execve, and SIGALRM's default
+# action terminates the process. Exit status is 124 (timeout) or 142 (SIGALRM).
+_with_timeout() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$secs" "$@"
+    elif command -v perl >/dev/null 2>&1; then
+        perl -e 'my $t = shift; alarm $t; exec @ARGV or die "exec failed: $!\n";' "$secs" "$@"
+    else
+        echo "no timeout mechanism available; running unbounded" >&2
+        "$@"
+    fi
+}
+
+# status.sh reads an empty or unparseable result as "still running". A worker
+# that died therefore has to leave behind a result that says so, or the poller
+# waits on it forever.
+_write_failure() {
+    local reason="$1"
+    [[ -s "$RESULT" ]] && mv "$RESULT" "$RESULT.partial"
+    python3 - "$RESULT" "$reason" <<'PY'
+import json, sys
+path, reason = sys.argv[1], sys.argv[2]
+with open(path, "w") as fh:
+    json.dump({
+        "is_error": True,
+        "subtype": "dispatch_error",
+        "result": reason,
+        "total_cost_usd": None,
+    }, fh)
+PY
+}
 
 run_worker() {
     cd "$WORKTREE"
-    claude -p "$(cat "$TASK_FILE")" \
+    local rc=0
+    _with_timeout "$TIMEOUT" claude -p "$(cat "$TASK_FILE")" \
         --output-format json \
         --permission-mode acceptEdits \
+        --max-turns "$MAX_TURNS" \
         --allowedTools "$ALLOWED_TOOLS" \
         --disallowedTools 'Bash(git push:*),Bash(rm:*),Bash(curl:*),WebFetch' \
-        > "$RESULT" 2> "$LOG"
+        > "$RESULT" 2> "$LOG" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        case $rc in
+            124|142) _write_failure "timed out after ${TIMEOUT}s (partial output in $(basename "$RESULT").partial)" ;;
+            *)       _write_failure "worker exited $rc; see $(basename "$LOG")" ;;
+        esac
+    fi
+    rm -f "$PIDFILE"
 }
 
 if [[ "$MODE" == "--fg" ]]; then
     run_worker
     echo "worker '$WORKER' finished -> $RESULT"
 else
-    run_worker &
-    echo "worker '$WORKER' started (pid $!) -> $RESULT"
+    # Re-invoke ourselves in foreground mode under nohup rather than serialising
+    # the worker function into a subshell. The worktree setup above is
+    # idempotent, so the second pass is a no-op up to this point.
+    #
+    # nohup, not setsid: macOS has no setsid, and without it a worker dies with
+    # the terminal session that launched it. The recorded PID is this wrapper's;
+    # killing it needs the descendants too (see kill_tree in overnight.sh).
+    nohup "$ROOT/orchestrator/spawn.sh" "$WORKER" "$TASK_FILE" --fg >/dev/null 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "worker '$WORKER' started (pid $(cat "$PIDFILE")) -> $RESULT"
 fi

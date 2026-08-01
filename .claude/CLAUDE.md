@@ -36,7 +36,14 @@ that file, and a merge conflict costs the manager more than the fix saves.
 
 ## Before you finish
 
-1. `python3 -m pytest -q` must pass.
+1. `.venv/bin/python -m pytest -q` must pass.
+
+   Use that interpreter, not a bare `python3`. `python3` resolves to whatever is
+   first on PATH — often a system or Anaconda build without this project's
+   dependencies, where the suite dies during collection on a missing import. That
+   failure is not yours; do not try to fix it by adding dependencies or editing
+   imports. If `.venv/bin/python` is missing, say so and stop.
+
 2. Commit your work with a clear message. Do not push.
 3. Your final message is read by the manager agent, not a human. Make it a terse
    status report: what you changed, what you verified, what you deliberately left

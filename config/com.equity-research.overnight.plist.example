@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Scheduled overnight run.
+
+  Install:
+    1. Edit the three marked values below (repo path, EDGAR identity, PATH).
+    2. cp config/com.equity-research.overnight.plist.example \
+         ~/Library/LaunchAgents/com.equity-research.overnight.plist
+    3. launchctl load ~/Library/LaunchAgents/com.equity-research.overnight.plist
+
+  Verify without waiting for 22:00:
+    launchctl start com.equity-research.overnight
+    tail -f /tmp/equity-research-overnight.log
+
+  Remove:
+    launchctl unload ~/Library/LaunchAgents/com.equity-research.overnight.plist
+
+  Notes:
+    - launchd gives an agent a near-empty environment: no shell profile is read,
+      so PATH and EDGAR_USER_AGENT must be set here or the run fails preflight.
+    - RunAtLoad is deliberately false. An agent that runs on load would fire a
+      full queue the moment you log in, which is not what "overnight" means.
+    - A LaunchAgent only fires while you are logged in. If the Mac sleeps at
+      22:00 the job runs when it next wakes, not at all if it never does — see
+      `caffeinate` in ORCHESTRATION.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.equity-research.overnight</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <!-- EDIT: repo path, budget, parallelism -->
+        <string>cd "$HOME/alpha/equity-research" &amp;&amp; exec orchestrator/overnight.sh --budget 20 --parallel 3</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- EDIT: your real contact address. The SEC returns 403 without one. -->
+        <key>EDGAR_USER_AGENT</key>
+        <string>Equity Research you@example.com</string>
+        <!-- EDIT: must contain the directory holding the `claude` binary. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>22</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/equity-research-overnight.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/equity-research-overnight.log</string>
+</dict>
+</plist>
