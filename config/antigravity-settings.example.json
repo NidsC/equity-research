@@ -1,0 +1,37 @@
+{
+  "//": "Merge this into ~/.gemini/antigravity-cli/settings.json — do not replace the file wholesale.",
+
+  "//sandbox": [
+    "Antigravity's terminal sandbox blocks outbound network requests from agent-run",
+    "commands. The Claude CLI needs the network to reach the API, so a sandboxed",
+    "`claude -p` will fail or hang. Disabling the sandbox is the pragmatic choice",
+    "given the permissions allowlist below already constrains what can run — but it",
+    "is a real loosening of isolation, so make it deliberately."
+  ],
+  "enableTerminalSandbox": false,
+
+  "permissions": {
+    "allow": [
+      "command(orchestrator/spawn.sh)",
+      "command(orchestrator/status.sh)",
+      "command(orchestrator/integrate.sh)",
+      "command(claude)",
+      "command(git status)",
+      "command(git log)",
+      "command(git diff)",
+      "command(git worktree list)",
+      "command(python3)",
+      "command(pytest)",
+      "command(uv)",
+      "command(cat)",
+      "command(ls)"
+    ],
+    "deny": [
+      "command(rm -rf)",
+      "command(git push)",
+      "command(git reset --hard)",
+      "command(curl)",
+      "command(sudo)"
+    ]
+  }
+}

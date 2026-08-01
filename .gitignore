@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Orchestration state — worker worktrees and run logs are local scratch
+.worktrees/
+orchestrator/runs/*.json
+
+# Filing cache and derived stores can be regenerated from EDGAR
+data/cache/
+data/*.duckdb
+data/*.duckdb.wal
+reports/
