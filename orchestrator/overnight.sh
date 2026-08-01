@@ -26,7 +26,7 @@ PYTHON="$ROOT/.venv/bin/python"
 QUEUE_DIR="$ROOT/orchestrator/tasks/queue"
 BUDGET_USD="20"
 PARALLEL="3"
-POLL_SECONDS="20"
+POLL_SECONDS="${ER_POLL_SECONDS:-20}"
 DRY_RUN=""
 
 while [[ $# -gt 0 ]]; do
@@ -118,19 +118,49 @@ fi
 
 # ---- helpers -----------------------------------------------------------
 
-# Total spend across every result file this run has produced.
-spend_so_far() {
-    python3 - "$RUNS" <<'PY'
-import glob, json, os, sys
-total = 0.0
-for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
+# Spend has to be banked as workers are reaped, not summed from result files on
+# demand: integrate.sh deletes a worker's result JSON when it merges cleanly, so
+# reading the files would silently zero out the cost of everything that
+# succeeded — and the budget would never trigger.
+SPEND_LEDGER="$RUNS/.spend-$STAMP"
+: > "$SPEND_LEDGER"
+
+record_spend() {
+    local worker="$1"
+    python3 - "$RUNS/$worker.json" "$RUNS/$worker.json.partial" >> "$SPEND_LEDGER" <<'PY'
+import json, sys
+
+def cost_in(path):
     try:
         with open(path) as fh:
-            cost = json.load(fh).get("total_cost_usd")
+            value = json.load(fh).get("total_cost_usd")
     except Exception:
-        continue
-    if isinstance(cost, (int, float)):
-        total += cost
+        return None
+    return value if isinstance(value, (int, float)) else None
+
+# A killed worker's result is a synthetic failure with no cost, so fall back to
+# whatever it had already streamed. If that is truncated mid-write there is
+# nothing to recover and the run under-counts by at most one worker.
+for candidate in sys.argv[1:]:
+    found = cost_in(candidate)
+    if found is not None:
+        print(f"{found:.6f}")
+        break
+PY
+}
+
+spend_so_far() {
+    python3 - "$SPEND_LEDGER" <<'PY'
+import sys
+total = 0.0
+try:
+    with open(sys.argv[1]) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                total += float(line)
+except FileNotFoundError:
+    pass
 print(f"{total:.4f}")
 PY
 }
@@ -224,6 +254,7 @@ while [[ $next -lt ${#queue[@]} || ${#running[@]} -gt 0 ]]; do
             done)
                 log "$worker finished; integrating"
                 done_workers+=("$worker")
+                record_spend "$worker"   # before integrate.sh deletes the result
                 if "$ROOT/orchestrator/integrate.sh" "$worker" >>"$RUNS/$worker.log" 2>&1; then
                     log "  merged $worker"
                     merged_workers+=("$worker")
@@ -234,6 +265,7 @@ while [[ $next -lt ${#queue[@]} || ${#running[@]} -gt 0 ]]; do
                 ;;
             failed)
                 log "$worker failed; leaving branch agent/$worker for inspection"
+                record_spend "$worker"
                 failed_workers+=("$worker")
                 ;;
         esac
@@ -244,7 +276,13 @@ while [[ $next -lt ${#queue[@]} || ${#running[@]} -gt 0 ]]; do
         log "Budget \$$BUDGET_USD exceeded; stopping in-flight workers."
         for worker in $(expand running); do
             kill_worker "$worker"
+            record_spend "$worker"
+            failed_workers+=("$worker")
         done
+        # Clear them here rather than waiting to reap. Killing the wrapper means
+        # spawn.sh never gets to write its failure result, so worker_state would
+        # keep reading these as "running" and the loop would never terminate.
+        running=()
         halted="budget"
     fi
 done

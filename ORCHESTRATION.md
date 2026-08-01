@@ -114,6 +114,13 @@ Nothing is supervised while it runs, so every loop is bounded independently:
 Budget is checked before each dispatch and after each poll. On breach, in-flight
 workers are killed and the rest of the queue is left undispatched and reported.
 
+It is a dispatch gate, not a hard cap: a worker is only started while spend is
+*under* the ceiling, so the final total can exceed it by roughly one worker's
+cost. Set the budget to the most you are willing to wake up to, not to the exact
+number. Cost is also only knowable once a worker finishes — `total_cost_usd`
+arrives with its result — so a worker killed mid-flight contributes whatever it
+had already streamed, or nothing if that output was truncated.
+
 ### Preflight refuses more than it accepts
 
 The run aborts before dispatching anything if the tests already fail on the
