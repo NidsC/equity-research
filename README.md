@@ -1,5 +1,10 @@
 # equity-research
 
+> **Shelved 2026-08-11.** The code below works and its tests pass. The project's
+> redefinition into a filings change-monitor (codename SENTINEL) was specified in full
+> and never built. See [`SENTINEL_SHELVED.md`](SENTINEL_SHELVED.md) for why and how to
+> restart, and [`ER TO SENTINEL/`](ER%20TO%20SENTINEL/) for the plans.
+
 AI equity research over SEC filings. Financials come from XBRL and are computed
 in Python; language models read narrative sections only and never produce a
 number that reaches a report.

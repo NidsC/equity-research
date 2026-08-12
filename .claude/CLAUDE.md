@@ -49,10 +49,6 @@ that file, and a merge conflict costs the manager more than the fix saves.
    status report: what you changed, what you verified, what you deliberately left
    alone, and anything the manager needs to decide.
 
-## Layout
+## Do not edit
 
-- `src/equity_research/ingest/` — EDGAR client, rate limiting, caching
-- `src/equity_research/parse/` — XBRL normalization, 10-K section extraction
-- `src/equity_research/analysis/` — prompts, schemas, headless Claude runner
-- `src/equity_research/report/` — memo rendering
 - `orchestrator/` — the manager's dispatch scripts. Do not edit unless told to.
